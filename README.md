@@ -1,0 +1,1 @@
+The www.etlsh.com blog resources

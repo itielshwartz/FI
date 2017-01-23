@@ -9,6 +9,8 @@ import requests
 import tqdm
 from aiohttp import ClientSession, TCPConnector
 
+MAX_CONNECTION = 1000
+
 logger = logging.getLogger(__name__)
 
 logger.setLevel(logging.DEBUG)
@@ -16,9 +18,7 @@ logger.setLevel(logging.DEBUG)
 console = logging.StreamHandler()
 logger.addHandler(console)
 # To make sure we don't kill the server/ our comp
-sem = asyncio.Semaphore(1000)
-# more connections = download faster
-conn = TCPConnector(limit=1000)
+sem = asyncio.Semaphore(MAX_CONNECTION)
 
 
 async def fetch(url, session):
@@ -33,26 +33,21 @@ async def bound_fetch(sem, url, session):
 
 
 async def download_with_retries(session, tasks):
-    max_retry_count, retry_count, responses = 5, 0, []
+    max_retry_count, retry_count, responses, retry_tasks = 5, 0, [], []
     while tasks:
         for f in tqdm.tqdm(asyncio.as_completed(tasks), total=len(tasks)):
-            responses.append(await f)
-        error_count, tasks, clean_response = 0, [], []
-        # in case we had problem with some requests, and we didn't exceeded retry we try again
-        if retry_count == max_retry_count:
-            break
-        for response, url in responses:
+            response, url = await f
             if response == {'error': 'Internal server error.'}:
-                tasks.append(asyncio.ensure_future(bound_fetch(sem, url, session)))
-                error_count += 1
+                retry_tasks.append(url)
             else:
-                clean_response.append((response, url))
-        responses = clean_response
-        if tasks:
-            retry_count += 1
-            time.sleep(3)  # letting the server recover..
-            logger.warning("retrying to download %s urls" % error_count)
-    responses = [response for response, url in responses]  # clean url from responses
+                responses.append(response)
+        # in case we had problem with some requests and we didn't exceeded retries - we try again
+        if retry_count == max_retry_count or not retry_tasks:
+            break
+        retry_count += 1
+        time.sleep(10)  # letting the server recover..
+        logger.warning("retrying to download %s urls" % len(retry_tasks))
+        tasks, retry_tasks = retry_tasks, []
     return responses
 
 
@@ -60,7 +55,8 @@ async def download_stories(max_item, n):
     url = "https://hacker-news.firebaseio.com/v0/item/{}.json"
     # Fetch all responses within one Client session,
     # keep connection alive for all requests.
-    async with ClientSession(connector=conn) as session:
+    stories_conn = TCPConnector(limit=min(MAX_CONNECTION, n))
+    async with ClientSession(connector=stories_conn) as session:
         tasks = [asyncio.ensure_future(bound_fetch(sem, url.format(max_item - i), session)) for i in
                  range(min(n, max_item))]
         return await download_with_retries(session, tasks)
@@ -71,7 +67,8 @@ async def download_users(users_names):
     tasks = []
     # Fetch all responses within one Client session,
     # keep connection alive for all requests.
-    conn = TCPConnector(limit=1500)
+    # more connections = download faster
+    conn = TCPConnector(limit=min(MAX_CONNECTION, len(users_names)))
     async with ClientSession(connector=conn) as session:
         tasks = [asyncio.ensure_future(bound_fetch(sem, url.format(user), session)) for user in users_names]
         return await download_with_retries(session, tasks)
@@ -85,14 +82,10 @@ def get_users(users_names):
 
 def get_last_n_stories(n, max_item=None):
     loop = asyncio.get_event_loop()
-    max_item = max_item or get_hn_max_item()
+    max_item = max_item or requests.get(
+        'https://hacker-news.firebaseio.com/v0/maxitem.json').json()
     future = asyncio.ensure_future(download_stories(max_item, n))
     return loop.run_until_complete(future)
-
-
-def get_hn_max_item():
-    return requests.get(
-        'https://hacker-news.firebaseio.com/v0/maxitem.json').json()
 
 
 def get_and_save_users_data(include_users, responses, users_output):
@@ -109,10 +102,11 @@ def get_and_save_users_data(include_users, responses, users_output):
 @click.option('--include-users', is_flag=True, help='should download users realted to posts')
 @click.option('--output', type=click.File('w'), help='the output file name', default="hn.json")
 @click.option('--users-output', type=click.File('w'), help='the users output file name', default="hn_users.json")
-def last_n(n, include_users, output, users_output):
+@click.option('--start-from', type=int, help='The item to start download from')
+def last_n(n, include_users, output, users_output, start_from):
     logger.info(
         "Starting download %s posts from HN, users %s" % (n, "included" if include_users else "not included"))
-    responses = get_last_n_stories(n)
+    responses = get_last_n_stories(n, start_from)
     logger.info("Saving the posts to %s", output.name)
     json.dump(responses, output, indent=4)
     get_and_save_users_data(include_users, responses, users_output)
